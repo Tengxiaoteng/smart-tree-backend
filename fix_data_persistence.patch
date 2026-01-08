@@ -1,0 +1,184 @@
+这个补丁文件包含了修复数据持久化问题的关键代码修改
+
+=== 文件 1: src/store/useStore.ts ===
+
+在 AppState 接口中添加以下方法：
+
+```typescript
+interface AppState {
+  // ... 现有字段 ...
+  
+  // 从后端加载数据
+  loadNodesFromServer: () => Promise<void>;
+  loadTopicsFromServer: () => Promise<void>;
+  syncNodeToServer: (node: KnowledgeNode) => Promise<void>;
+}
+```
+
+在 create 函数中添加以下实现（在现有的 addNode 之前）：
+
+```typescript
+// 从服务器加载主题
+loadTopicsFromServer: async () => {
+  try {
+    const response = await fetch('/api/topics');
+    if (!response.ok) return;
+    
+    const { data } = await response.json();
+    const topics: Record<string, Topic> = {};
+    data.forEach((topic: Topic) => {
+      topics[topic.id] = topic;
+    });
+    
+    set({ topics });
+  } catch (error) {
+    console.error('加载主题失败:', error);
+  }
+},
+
+// 从服务器加载节点
+loadNodesFromServer: async () => {
+  try {
+    const topicId = get().currentTopicId;
+    const url = topicId ? `/api/nodes?topicId=${topicId}` : '/api/nodes';
+    
+    const response = await fetch(url);
+    if (!response.ok) return;
+    
+    const { data } = await response.json();
+    
+    const nodes: Record<string, KnowledgeNode> = {};
+    const rootNodeIds: string[] = [];
+    
+    data.forEach((node: KnowledgeNode) => {
+      nodes[node.id] = node;
+      if (!node.parentId) {
+        rootNodeIds.push(node.id);
+      }
+    });
+    
+    set({ nodes, rootNodeIds });
+  } catch (error) {
+    console.error('加载节点失败:', error);
+  }
+},
+
+// 同步节点到服务器
+syncNodeToServer: async (node: KnowledgeNode) => {
+  try {
+    const response = await fetch('/api/nodes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(node),
+    });
+    
+    if (!response.ok) {
+      console.error('同步节点失败');
+    }
+  } catch (error) {
+    console.error('同步节点失败:', error);
+  }
+},
+```
+
+修改现有的 addNode 方法，添加服务器同步：
+
+```typescript
+addNode: (node: KnowledgeNode) => {
+  set((state) => {
+    const newNodes = { ...state.nodes, [node.id]: node };
+    const newRootNodeIds = node.parentId
+      ? state.rootNodeIds
+      : [...state.rootNodeIds, node.id];
+
+    // 异步同步到服务器（不阻塞 UI）
+    get().syncNodeToServer(node);
+
+    return {
+      nodes: newNodes,
+      rootNodeIds: newRootNodeIds,
+      selectedNodeId: node.id,
+      expandedNodeIds: node.parentId
+        ? [...state.expandedNodeIds, node.parentId]
+        : state.expandedNodeIds,
+    };
+  });
+},
+```
+
+=== 文件 2: src/app/page.tsx ===
+
+在 Home 组件中添加数据加载逻辑：
+
+```typescript
+export default function Home() {
+  const { 
+    rootNodeIds, 
+    selectedNodeId, 
+    activeTab, 
+    setActiveTab, 
+    addNodeDialogOpen, 
+    setAddNodeDialogOpen, 
+    currentTopicId, 
+    topics, 
+    migrateOldNodes, 
+    sidebarCollapsed, 
+    setSidebarCollapsed,
+    loadNodesFromServer,  // 添加这个
+    loadTopicsFromServer  // 添加这个
+  } = useStore();
+
+  const hasTopics = Object.keys(topics).length > 0;
+
+  // 自动迁移旧数据
+  useEffect(() => {
+    migrateOldNodes();
+  }, []);
+
+  // 添加：从服务器加载数据
+  useEffect(() => {
+    const loadData = async () => {
+      await loadTopicsFromServer();
+      await loadNodesFromServer();
+    };
+    
+    loadData();
+  }, [loadTopicsFromServer, loadNodesFromServer]);
+
+  // ... 其余代码保持不变 ...
+}
+```
+
+=== 文件 3: src/components/Auth/UserMenu.tsx ===
+
+确保退出登录时不清除 localStorage：
+
+```typescript
+const handleLogout = async () => {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  // 注意：不要清除 localStorage
+  // 如果有 localStorage.clear() 或类似代码，请删除
+  router.push('/login');
+  router.refresh();
+};
+```
+
+=== 应用补丁的步骤 ===
+
+1. 备份现有代码
+2. 按照上述修改更新对应文件
+3. 重启开发服务器
+4. 测试功能：
+   - 创建新节点
+   - 退出登录
+   - 重新登录
+   - 验证节点是否还在
+
+=== 注意事项 ===
+
+1. 这个补丁实现了基本的数据同步功能
+2. 节点创建时会同步到服务器
+3. 页面加载时会从服务器加载数据
+4. localStorage 仍然作为缓存使用，提供更好的用户体验
+5. 如果需要完整的 CRUD 同步，还需要修改 updateNode 和 deleteNode 方法
+

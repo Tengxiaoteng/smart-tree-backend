@@ -30,12 +30,13 @@ class UserCreditLedger(Base):
 
     createdAt = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    user = relationship("User", back_populates="creditLedger")
+    user = relationship("User", back_populates="creditLedger", overlaps="ledger")
     account = relationship(
         "UserCreditAccount",
         back_populates="ledger",
         primaryjoin="UserCreditLedger.userId == UserCreditAccount.userId",
-        foreign_keys=[userId]
+        foreign_keys=[userId],
+        overlaps="creditLedger,user",
     )
 
     __table_args__ = (
@@ -45,4 +46,3 @@ class UserCreditLedger(Base):
 
     def __repr__(self):
         return f"<UserCreditLedger userId={self.userId} kind={self.kind} delta={self.delta}>"
-

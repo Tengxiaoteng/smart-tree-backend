@@ -1,5 +1,6 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +9,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.models import User, Topic, KnowledgeNode, UserSettings, Material
-from app.routes import topics, nodes, auth, materials, questions, answer_records, node_material_links, node_prerequisites, user_notes, user_settings, user_profile, upload, files, credits, llm, batches, tree
+from app.routes import topics, nodes, auth, materials, questions, answer_records, node_material_links, node_prerequisites, user_notes, user_settings, user_profile, upload, files, credits, llm, batches, tree, community, health
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    _run_startup()
+    yield
+
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -16,7 +24,8 @@ app = FastAPI(
     version=settings.API_VERSION,
     description=settings.API_DESCRIPTION,
     docs_url="/docs",
-    openapi_url="/openapi.json"
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
 
 @app.exception_handler(SQLAlchemyError)
@@ -28,8 +37,7 @@ async def _sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
         detail = f"{detail}: {exc}"
     return JSONResponse(status_code=500, content={"detail": detail})
 
-@app.on_event("startup")
-def _startup() -> None:
+def _run_startup() -> None:
     auto_create_tables = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
     if auto_create_tables:
         try:
@@ -347,6 +355,7 @@ async def health_check_db():
         raise
 
 # 包含路由
+app.include_router(health.router, prefix="/api/health", tags=["Health"])
 app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(topics.router, prefix="/api/topics", tags=["Topics"])
 app.include_router(nodes.router, prefix="/api/nodes", tags=["Nodes"])
@@ -364,6 +373,7 @@ app.include_router(credits.router, prefix="/api/credits", tags=["Credits"])
 app.include_router(llm.router, prefix="/api/llm", tags=["LLM"])
 app.include_router(batches.router, prefix="/api/batches", tags=["Batch"])
 app.include_router(tree.router, prefix="/api/tree", tags=["Tree Generation"])
+app.include_router(community.router, prefix="/api/community", tags=["Community"])
 
 if __name__ == "__main__":
     import uvicorn

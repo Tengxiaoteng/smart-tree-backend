@@ -26,7 +26,8 @@ class UserCreditAccount(Base):
         back_populates="account",
         cascade="all, delete-orphan",
         primaryjoin="UserCreditAccount.userId == UserCreditLedger.userId",
-        foreign_keys="UserCreditLedger.userId"
+        foreign_keys="UserCreditLedger.userId",
+        overlaps="creditLedger",
     )
 
     def __repr__(self):

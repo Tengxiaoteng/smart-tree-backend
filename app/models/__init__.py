@@ -11,6 +11,10 @@ from .user_note import UserNote
 from .user_credit_account import UserCreditAccount
 from .user_credit_ledger import UserCreditLedger
 from .user_batch_job import UserBatchJob
+from .category import Category
+from .post import Post
+from .comment import Comment
+from .post_view import PostView
 
 __all__ = [
     "User",
@@ -27,4 +31,8 @@ __all__ = [
     "UserCreditAccount",
     "UserCreditLedger",
     "UserBatchJob",
+    "Category",
+    "Post",
+    "Comment",
+    "PostView",
 ]

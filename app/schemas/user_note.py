@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class UserNoteCreate(BaseModel):
@@ -32,6 +32,4 @@ class UserNoteResponse(BaseModel):
     createdAt: datetime
     updatedAt: datetime
 
-    class Config:
-        from_attributes = True
-
+    model_config = ConfigDict(from_attributes=True)

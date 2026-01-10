@@ -12,7 +12,7 @@ import time
 from typing import Any, AsyncGenerator, Literal
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -38,9 +38,7 @@ class KnowledgeNodeSchema(BaseModel):
     question_patterns: list[str] = Field(default_factory=list, alias="questionPatterns")
     common_mistakes: list[str] = Field(default_factory=list, alias="commonMistakes")
 
-    class Config:
-        populate_by_name = True
-        by_alias = True
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
 
 class KnowledgeTreeSchema(BaseModel):

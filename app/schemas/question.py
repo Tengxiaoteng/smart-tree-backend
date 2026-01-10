@@ -150,5 +150,4 @@ class QuestionResponse(BaseModel):
     def _normalize_related_concepts(cls, value: Any):
         return _parse_jsonish_text(value)
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import logging
+import re
 from app.core.database import get_db
 from app.core.security import (
     verify_password,
@@ -16,16 +17,88 @@ import uuid
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# 验证规则常量
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 20
+PASSWORD_MIN_LENGTH = 6
+PASSWORD_MAX_LENGTH = 18
+NICKNAME_MAX_LENGTH = 30
+
+# 用户名只允许字母、数字、下划线
+USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_]+$')
+
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空')
+        if len(v) > USERNAME_MAX_LENGTH:
+            raise ValueError(f'用户名长度不能超过 {USERNAME_MAX_LENGTH} 个字符')
+        return v
+
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if not v:
+            raise ValueError('密码不能为空')
+        if len(v) > PASSWORD_MAX_LENGTH:
+            raise ValueError(f'密码长度不能超过 {PASSWORD_MAX_LENGTH} 个字符')
+        return v
+
 
 class RegisterRequest(BaseModel):
     username: str
     password: str
+    confirmPassword: str | None = None
     nickname: str | None = None
+
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError('用户名不能为空')
+        if len(v) < USERNAME_MIN_LENGTH:
+            raise ValueError(f'用户名长度不能少于 {USERNAME_MIN_LENGTH} 个字符')
+        if len(v) > USERNAME_MAX_LENGTH:
+            raise ValueError(f'用户名长度不能超过 {USERNAME_MAX_LENGTH} 个字符')
+        if not USERNAME_PATTERN.match(v):
+            raise ValueError('用户名只能包含字母、数字和下划线')
+        return v
+
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if not v:
+            raise ValueError('密码不能为空')
+        if len(v) < PASSWORD_MIN_LENGTH:
+            raise ValueError(f'密码长度不能少于 {PASSWORD_MIN_LENGTH} 个字符')
+        if len(v) > PASSWORD_MAX_LENGTH:
+            raise ValueError(f'密码长度不能超过 {PASSWORD_MAX_LENGTH} 个字符')
+        # 密码强度检查：至少包含字母和数字
+        if not re.search(r'[a-zA-Z]', v):
+            raise ValueError('密码必须包含至少一个字母')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('密码必须包含至少一个数字')
+        return v
+
+    @field_validator('nickname')
+    @classmethod
+    def validate_nickname(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) > NICKNAME_MAX_LENGTH:
+            raise ValueError(f'昵称长度不能超过 {NICKNAME_MAX_LENGTH} 个字符')
+        return v
 
 
 class AuthResponse(BaseModel):
@@ -46,10 +119,9 @@ async def login(
     db: Session = Depends(get_db),
 ):
     """用户登录"""
-    username = request.username.strip() if request.username else ""
-    password = request.password.strip() if request.password else ""
-    if not username or not password:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户名或密码不能为空")
+    # Pydantic 已验证并 strip，直接使用
+    username = request.username
+    password = request.password
 
     logger.debug("用户登录请求: %s", username)
     user = db.query(User).filter(User.username == username).first()
@@ -79,16 +151,18 @@ async def register(
     db: Session = Depends(get_db),
 ):
     """用户注册"""
-    username = request.username.strip() if request.username else ""
-    password = request.password.strip() if request.password else ""
-    nickname = request.nickname.strip() if request.nickname else None
+    # Pydantic 已验证并 strip，直接使用
+    username = request.username
+    password = request.password
+    confirm_password = request.confirmPassword
+    nickname = request.nickname
 
-    if not username or not password:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户名或密码不能为空")
-    if len(username) < 3 or len(username) > 20:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户名长度需为 3-20 个字符")
-    if len(password) < 6:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="密码至少 6 个字符")
+    # 验证确认密码
+    if confirm_password is not None and password != confirm_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="两次输入的密码不一致",
+        )
 
     # 检查用户名是否已存在
     existing = db.query(User).filter(User.username == username).first()

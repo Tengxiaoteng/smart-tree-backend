@@ -1,10 +1,24 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import StreamingResponse
+import json
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models import User, Question, KnowledgeNode
 from app.schemas.question import QuestionCreate, QuestionUpdate, QuestionResponse
+from app.services.question_generation import (
+    generate_questions_batch,
+    generate_questions_batch_stream,
+    QuestionBatchRequest,
+    QuestionGenerationResult,
+    QuestionProgressEvent,
+    MaterialInfo,
+    LearningGoalInfo,
+    QuestionSourceConfig,
+    DifficultyDistribution,
+)
 
 router = APIRouter()
 
@@ -242,3 +256,269 @@ async def delete_question(
     db.delete(question)
     db.commit()
     return {"success": True}
+
+
+# ==================== 并行生成题目 API ====================
+
+class MaterialInfoRequest(BaseModel):
+    """资料信息请求"""
+    id: str
+    name: str
+    content: str = ""
+    contentDigest: str = ""
+    keyTopics: list[str] = Field(default_factory=list)
+    structuredSummary: str = ""
+    structuredKeyPoints: list[dict] = Field(default_factory=list)
+    questionablePoints: list[str] = Field(default_factory=list)
+
+
+class LearningGoalRequest(BaseModel):
+    """学习目标请求"""
+    id: str
+    goal: str
+    importance: str = "medium"
+    subGoals: list[str] = Field(default_factory=list)
+
+
+class QuestionSourceConfigRequest(BaseModel):
+    """出题来源配置"""
+    useNodeContent: bool = True
+    useMaterials: bool = True
+    useLearningGoals: bool = False
+    selectedMaterialIds: list[str] = Field(default_factory=list)
+    selectedGoalIds: list[str] = Field(default_factory=list)
+
+
+class DifficultyDistributionRequest(BaseModel):
+    """难度分布配置"""
+    easy: int = 30
+    medium: int = 50
+    hard: int = 20
+
+
+class GenerateQuestionsRequest(BaseModel):
+    """并行生成题目请求 - 支持多来源"""
+    # 节点信息
+    nodeId: str
+    nodeName: str
+    nodeDescription: str = ""
+    knowledgeType: str = "concept"
+    nodeDifficulty: str = "beginner"
+    learningObjectives: list[str] = Field(default_factory=list)
+    keyConcepts: list[str] = Field(default_factory=list)
+    commonMistakes: list[str] = Field(default_factory=list)
+
+    # 资料列表
+    materials: list[MaterialInfoRequest] = Field(default_factory=list)
+
+    # 学习目标列表
+    learningGoals: list[LearningGoalRequest] = Field(default_factory=list)
+
+    # 出题配置
+    sources: QuestionSourceConfigRequest = Field(default_factory=QuestionSourceConfigRequest)
+    difficulty: DifficultyDistributionRequest = Field(default_factory=DifficultyDistributionRequest)
+    count: int = 5
+    questionTypes: list[str] = Field(default_factory=lambda: ["single", "judge"])
+    mode: str = "normal"  # normal / review / advance
+
+    # 🎯 用户学习画像（用于个性化出题）
+    learnerProfilePrompt: str = ""
+
+    # 兼容旧字段
+    materialsContent: str = ""
+
+    # API 选择
+    useSystemKey: bool | None = None
+
+
+@router.post("/generate", response_model=QuestionGenerationResult)
+async def generate_questions(
+    payload: GenerateQuestionsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    并行生成题目
+
+    - 官方 API (useSystemKey=true): 使用两阶段并行架构（规划 + 并发生成）
+    - 用户自配 API (useSystemKey=false): 使用单次生成方式
+    """
+    # 验证节点存在
+    node = db.query(KnowledgeNode).filter(
+        KnowledgeNode.id == payload.nodeId,
+        KnowledgeNode.userId == current_user.id,
+    ).first()
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识点不存在")
+
+    # 转换资料列表
+    materials = [
+        MaterialInfo(
+            id=m.id,
+            name=m.name,
+            content=m.content,
+            contentDigest=m.contentDigest,
+            keyTopics=m.keyTopics,
+            structuredSummary=m.structuredSummary,
+            structuredKeyPoints=m.structuredKeyPoints,
+            questionablePoints=m.questionablePoints,
+        )
+        for m in payload.materials
+    ]
+
+    # 转换学习目标列表
+    learning_goals = [
+        LearningGoalInfo(
+            id=g.id,
+            goal=g.goal,
+            importance=g.importance,
+            subGoals=g.subGoals,
+        )
+        for g in payload.learningGoals
+    ]
+
+    # 转换出题配置
+    sources = QuestionSourceConfig(
+        useNodeContent=payload.sources.useNodeContent,
+        useMaterials=payload.sources.useMaterials,
+        useLearningGoals=payload.sources.useLearningGoals,
+        selectedMaterialIds=payload.sources.selectedMaterialIds,
+        selectedGoalIds=payload.sources.selectedGoalIds,
+    )
+
+    difficulty = DifficultyDistribution(
+        easy=payload.difficulty.easy,
+        medium=payload.difficulty.medium,
+        hard=payload.difficulty.hard,
+    )
+
+    request = QuestionBatchRequest(
+        nodeId=payload.nodeId,
+        nodeName=payload.nodeName,
+        nodeDescription=payload.nodeDescription,
+        knowledgeType=payload.knowledgeType,
+        nodeDifficulty=payload.nodeDifficulty,
+        learningObjectives=payload.learningObjectives,
+        keyConcepts=payload.keyConcepts,
+        commonMistakes=payload.commonMistakes,
+        materials=materials,
+        learningGoals=learning_goals,
+        sources=sources,
+        difficulty=difficulty,
+        count=payload.count,
+        questionTypes=payload.questionTypes,
+        mode=payload.mode,
+        learnerProfilePrompt=payload.learnerProfilePrompt,  # 🎯 用户学习画像
+        materialsContent=payload.materialsContent,
+    )
+
+    result = await generate_questions_batch(
+        db=db,
+        user_id=current_user.id,
+        request=request,
+        use_system=payload.useSystemKey,
+    )
+
+    return result
+
+
+@router.post("/generate/stream")
+async def generate_questions_stream(
+    payload: GenerateQuestionsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    流式并行生成题目（带进度反馈）
+
+    返回 SSE 流，包含进度事件和最终结果
+    """
+    # 验证节点存在
+    node = db.query(KnowledgeNode).filter(
+        KnowledgeNode.id == payload.nodeId,
+        KnowledgeNode.userId == current_user.id,
+    ).first()
+    if not node:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识点不存在")
+
+    # 转换资料列表
+    materials = [
+        MaterialInfo(
+            id=m.id,
+            name=m.name,
+            content=m.content,
+            contentDigest=m.contentDigest,
+            keyTopics=m.keyTopics,
+            structuredSummary=m.structuredSummary,
+            structuredKeyPoints=m.structuredKeyPoints,
+            questionablePoints=m.questionablePoints,
+        )
+        for m in payload.materials
+    ]
+
+    # 转换学习目标列表
+    learning_goals = [
+        LearningGoalInfo(
+            id=g.id,
+            goal=g.goal,
+            importance=g.importance,
+            subGoals=g.subGoals,
+        )
+        for g in payload.learningGoals
+    ]
+
+    # 转换出题配置
+    sources = QuestionSourceConfig(
+        useNodeContent=payload.sources.useNodeContent,
+        useMaterials=payload.sources.useMaterials,
+        useLearningGoals=payload.sources.useLearningGoals,
+        selectedMaterialIds=payload.sources.selectedMaterialIds,
+        selectedGoalIds=payload.sources.selectedGoalIds,
+    )
+
+    difficulty = DifficultyDistribution(
+        easy=payload.difficulty.easy,
+        medium=payload.difficulty.medium,
+        hard=payload.difficulty.hard,
+    )
+
+    request = QuestionBatchRequest(
+        nodeId=payload.nodeId,
+        nodeName=payload.nodeName,
+        nodeDescription=payload.nodeDescription,
+        knowledgeType=payload.knowledgeType,
+        nodeDifficulty=payload.nodeDifficulty,
+        learningObjectives=payload.learningObjectives,
+        keyConcepts=payload.keyConcepts,
+        commonMistakes=payload.commonMistakes,
+        materials=materials,
+        learningGoals=learning_goals,
+        sources=sources,
+        difficulty=difficulty,
+        count=payload.count,
+        questionTypes=payload.questionTypes,
+        mode=payload.mode,
+        learnerProfilePrompt=payload.learnerProfilePrompt,  # 🎯 用户学习画像
+        materialsContent=payload.materialsContent,
+    )
+
+    async def event_generator():
+        async for event in generate_questions_batch_stream(
+            db=db,
+            user_id=current_user.id,
+            request=request,
+            use_system=payload.useSystemKey,
+        ):
+            if isinstance(event, QuestionProgressEvent):
+                yield f"data: {json.dumps({'type': 'progress', 'data': event.model_dump()}, ensure_ascii=False)}\n\n"
+            elif isinstance(event, QuestionGenerationResult):
+                yield f"data: {json.dumps({'type': 'result', 'data': event.model_dump()}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )

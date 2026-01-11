@@ -38,12 +38,12 @@ async def _sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
     return JSONResponse(status_code=500, content={"detail": detail})
 
 def _run_startup() -> None:
+    """应用启动时执行：创建表 + 运行迁移"""
     auto_create_tables = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
     if auto_create_tables:
         try:
             Base.metadata.create_all(bind=engine)
         except SQLAlchemyError as exc:
-            # 不阻断启动：即使无法创建新表，也尽量让已存在的功能可用
             logging.exception("数据库初始化失败（无法创建表），请检查 DATABASE_URL 连接与权限: %s", exc)
 
     auto_migrate_schema = os.getenv("AUTO_MIGRATE_SCHEMA", "true").lower() == "true"

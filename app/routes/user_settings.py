@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError, ProgrammingError
 from app.core.database import get_db
 from app.core.security import get_current_user
+from app.core.encryption import encrypt_api_key, decrypt_api_key
 from app.models import User, UserSettings
 from app.schemas.user_settings import UserSettingsUpdate, UserSettingsResponse
 
@@ -15,8 +16,12 @@ def _settings_to_response(settings: UserSettings) -> UserSettingsResponse:
     use_system_override = extras.get("useSystemKey") if isinstance(extras, dict) else None
     routing_override = extras.get("routing") if isinstance(extras, dict) else None
     inferred = bool(settings.apiKey or settings.modelId or settings.baseUrl)
+
+    # 解密 API Key（兼容旧的明文数据）
+    decrypted_api_key = decrypt_api_key(settings.apiKey) if settings.apiKey else ""
+
     return UserSettingsResponse(
-        apiKey=settings.apiKey or "",
+        apiKey=decrypted_api_key or "",
         modelId=settings.modelId or "",
         baseUrl=settings.baseUrl or "",
         remember=bool(remember_override) if remember_override is not None else inferred,
@@ -89,7 +94,8 @@ async def save_user_settings(
         db.add(settings)
 
     if data.apiKey is not None:
-        settings.apiKey = data.apiKey
+        # 加密存储 API Key
+        settings.apiKey = encrypt_api_key(data.apiKey) if data.apiKey else None
     if data.modelId is not None:
         settings.modelId = data.modelId
     if data.baseUrl is not None:
@@ -163,7 +169,8 @@ async def update_user_settings(
         db.add(settings)
 
     if data.apiKey is not None:
-        settings.apiKey = data.apiKey
+        # 加密存储 API Key
+        settings.apiKey = encrypt_api_key(data.apiKey) if data.apiKey else None
     if data.modelId is not None:
         settings.modelId = data.modelId
     if data.baseUrl is not None:

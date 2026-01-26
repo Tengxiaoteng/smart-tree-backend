@@ -10,9 +10,9 @@ class DisplayConfig(BaseModel):
 
 
 class VisualConfig(BaseModel):
-    layoutDirection: Literal["horizontal", "vertical"] = "horizontal"
     nodeSpacing: int = Field(default=60, ge=20, le=200)
-    colorTheme: Literal["default", "colorful", "minimal"] = "default"
+    nodeSize: Literal["small", "medium", "large"] = "medium"
+    lineStyle: Literal["curve", "straight", "polyline"] = "curve"
 
 
 class ExpandConfig(BaseModel):
@@ -21,12 +21,11 @@ class ExpandConfig(BaseModel):
 
 class TreeSettingsBase(BaseModel):
     sortMode: Literal[
-        "createdAt_asc", 
-        "createdAt_desc", 
-        "name_asc", 
-        "mastery_asc", 
-        "mastery_desc", 
-        "manual"
+        "createdAt_asc",
+        "createdAt_desc",
+        "name_asc",
+        "mastery_asc",
+        "mastery_desc"
     ] = "createdAt_desc"
     displayConfig: Optional[DisplayConfig] = None
     visualConfig: Optional[VisualConfig] = None
@@ -39,12 +38,11 @@ class TreeSettingsCreate(TreeSettingsBase):
 
 class TreeSettingsUpdate(BaseModel):
     sortMode: Optional[Literal[
-        "createdAt_asc", 
-        "createdAt_desc", 
-        "name_asc", 
-        "mastery_asc", 
-        "mastery_desc", 
-        "manual"
+        "createdAt_asc",
+        "createdAt_desc",
+        "name_asc",
+        "mastery_asc",
+        "mastery_desc"
     ]] = None
     displayConfig: Optional[DisplayConfig] = None
     visualConfig: Optional[VisualConfig] = None

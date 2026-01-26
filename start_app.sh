@@ -48,8 +48,8 @@ if [ "$BACKEND_RUNNING" = false ]; then
       fi
     fi
 
-    echo "启动命令: ENV_FILE=${ENV_FILE_TO_USE} uvicorn main:app --reload --host 127.0.0.1 --port 8000"
-    nohup env ENV_FILE="${ENV_FILE_TO_USE}" uvicorn main:app --reload --host 127.0.0.1 --port 8000 > backend.log 2>&1 &
+    echo "启动命令: ENV_FILE=${ENV_FILE_TO_USE} uvicorn main:app --reload --host 0.0.0.0 --port 8000"
+    nohup env ENV_FILE="${ENV_FILE_TO_USE}" uvicorn main:app --reload --host 0.0.0.0 --port 8000 > backend.log 2>&1 &
     BACKEND_PID=$!
     
     echo "后端进程 PID: $BACKEND_PID"

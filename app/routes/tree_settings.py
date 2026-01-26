@@ -17,9 +17,9 @@ DEFAULT_SETTINGS = {
         "showDescription": False,
     },
     "visualConfig": {
-        "layoutDirection": "horizontal",
         "nodeSpacing": 60,
-        "colorTheme": "default",
+        "nodeSize": "medium",
+        "lineStyle": "curve",
     },
     "expandConfig": {
         "defaultExpandLevel": 3,

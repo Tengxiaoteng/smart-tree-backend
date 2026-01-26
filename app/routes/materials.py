@@ -104,6 +104,7 @@ async def get_materials(
     if nodeId:
         materials = [m for m in materials if (m.nodeIds or []) and nodeId in (m.nodeIds or [])]
 
+    print(f"[获取资料列表] topicId: {topicId}, includeNoTopic: {includeNoTopic}, nodeId: {nodeId}, 返回数量: {len(materials)}")
     return materials
 
 
@@ -191,13 +192,29 @@ async def create_material(
         "isOrganized": bool(data.isOrganized) if data.isOrganized is not None else False,
         "structuredContent": data.structuredContent,
         "isStructured": bool(data.isStructured) if data.isStructured is not None else False,
+        # 快速匹配字段
+        "contentDigest": data.contentDigest,
+        "keyTopics": data.keyTopics,
+        "contentHash": data.contentHash,
+        "digestGeneratedAt": data.digestGeneratedAt,
     }
     if data.id:
         material_kwargs["id"] = data.id
 
     material = Material(**material_kwargs)
     db.add(material)
-    db.commit()
+
+    try:
+        db.commit()
+        print(f"[资料保存成功] ID: {material.id}, 名称: {material.name}, topicId: {material.topicId}, nodeIds: {material.nodeIds}")
+    except Exception as e:
+        db.rollback()
+        print(f"[资料保存失败] 错误: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"资料保存失败: {str(e)}"
+        )
+
     db.refresh(material)
     return material
 

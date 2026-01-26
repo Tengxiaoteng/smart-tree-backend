@@ -1,0 +1,45 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+env
+venv
+.venv
+ENV
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploads (mount as volume instead)
+uploads/
+
+# Environment files
+.env
+.env.*
+!.env.*.example
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Git
+.git
+.gitignore
+
+# Tests
+test_*.py
+tests/
+
+# Misc
+README.md
+*.md
+

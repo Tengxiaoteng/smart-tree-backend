@@ -1,0 +1,445 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import desc, func
+from typing import Optional
+import uuid
+import logging
+
+from app.core.database import get_db
+from app.core.security import get_current_user, get_current_user_optional
+from app.models import User, Post, Comment, Category, PostView
+from app.schemas.community import (
+    PostCreate, PostUpdate, PostResponse, PostListResponse, PostAuthor,
+    CommentCreate, CommentResponse, CommentAuthor,
+    CategoryResponse, ShareResponse
+)
+from app.services.hot_ranking import get_hot_posts, record_post_view
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# 系统预设分类
+PRESET_CATEGORIES = [
+    {"id": "cat-stem", "name": "理工科学", "sortOrder": 1},
+    {"id": "cat-humanities", "name": "人文社科", "sortOrder": 2},
+    {"id": "cat-language", "name": "语言学习", "sortOrder": 3},
+    {"id": "cat-arts", "name": "艺术创作", "sortOrder": 4},
+    {"id": "cat-study", "name": "学习方法", "sortOrder": 5},
+    {"id": "cat-exam", "name": "考试备考", "sortOrder": 6},
+    {"id": "cat-career", "name": "职业发展", "sortOrder": 7},
+    {"id": "cat-tech", "name": "技术交流", "sortOrder": 8},
+    {"id": "cat-life", "name": "生活日常", "sortOrder": 9},
+    {"id": "cat-qa", "name": "问题求助", "sortOrder": 10},
+    {"id": "cat-share", "name": "经验分享", "sortOrder": 11},
+    {"id": "cat-other", "name": "其他", "sortOrder": 99},
+]
+
+
+def init_categories(db: Session):
+    """初始化系统预设分类"""
+    for cat_data in PRESET_CATEGORIES:
+        existing = db.query(Category).filter(Category.id == cat_data["id"]).first()
+        if not existing:
+            category = Category(**cat_data)
+            db.add(category)
+    db.commit()
+
+
+def get_post_author(user: User) -> PostAuthor:
+    """获取帖子作者信息"""
+    avatar_url = None
+    if user.profile:
+        avatar_url = user.profile.avatarUrl
+    return PostAuthor(
+        id=user.id,
+        username=user.username,
+        nickname=user.nickname,
+        avatarUrl=avatar_url
+    )
+
+
+def post_to_response(post: Post, db: Session) -> PostResponse:
+    """将 Post 模型转换为响应"""
+    author = None
+    if post.user:
+        author = get_post_author(post.user)
+    
+    return PostResponse(
+        id=post.id,
+        userId=post.userId,
+        title=post.title,
+        content=post.content,
+        images=post.images,
+        nodeId=post.nodeId,
+        topicId=post.topicId,
+        shareCode=post.shareCode,
+        categoryId=post.categoryId,
+        tags=post.tags,
+        viewCount=post.viewCount,
+        commentCount=post.commentCount,
+        shareCount=post.shareCount,
+        createdAt=post.createdAt,
+        updatedAt=post.updatedAt,
+        author=author
+    )
+
+
+# ============ 分类 API ============
+@router.get("/categories", response_model=list[CategoryResponse])
+async def get_categories(db: Session = Depends(get_db)):
+    """获取系统分类列表（无需登录）"""
+    # 确保预设分类已初始化
+    init_categories(db)
+    
+    categories = db.query(Category).order_by(Category.sortOrder).all()
+    return categories
+
+
+# ============ 帖子 API ============
+@router.get("/posts", response_model=PostListResponse)
+async def get_posts(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    categoryId: Optional[str] = None,
+    tag: Optional[str] = None,
+    search: Optional[str] = None,
+    sort: str = Query("latest", pattern="^(latest|hot|recommended)$"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """获取帖子列表（无需登录，推荐排序需登录）"""
+    query = db.query(Post)
+
+    # 分类筛选
+    if categoryId:
+        query = query.filter(Post.categoryId == categoryId)
+
+    # 标签筛选
+    if tag:
+        # JSON 数组包含查询
+        query = query.filter(Post.tags.contains([tag]))
+
+    # 搜索
+    if search:
+        search_pattern = f"%{search}%"
+        query = query.filter(
+            (Post.title.ilike(search_pattern)) |
+            (Post.content.ilike(search_pattern))
+        )
+
+    # 总数
+    total = query.count()
+
+    # 推荐排序特殊处理
+    if sort == "recommended" and current_user:
+        from app.services.recommendation import get_recommended_posts
+
+        # 获取所有符合条件的帖子（推荐排序需要全量计算）
+        all_posts = query.order_by(desc(Post.createdAt)).all()
+
+        # 个性化推荐排序
+        sorted_posts = get_recommended_posts(db, current_user.id, all_posts)
+
+        # 手动分页
+        offset = (page - 1) * limit
+        posts = sorted_posts[offset:offset + limit]
+    elif sort == "hot":
+        # 热门排序：使用48小时滑动窗口算法
+        all_posts = query.all()
+        sorted_posts = get_hot_posts(db, all_posts)
+
+        # 手动分页
+        offset = (page - 1) * limit
+        posts = sorted_posts[offset:offset + limit]
+    else:
+        # latest 或未登录的 recommended 都按时间排序
+        query = query.order_by(desc(Post.createdAt))
+
+        # 分页
+        offset = (page - 1) * limit
+        posts = query.offset(offset).limit(limit).all()
+
+    items = [post_to_response(post, db) for post in posts]
+
+    return PostListResponse(
+        items=items,
+        total=total,
+        page=page,
+        limit=limit,
+        hasMore=(offset + len(posts)) < total
+    )
+
+
+@router.get("/posts/{post_id}", response_model=PostResponse)
+async def get_post(
+    post_id: str,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """获取帖子详情（无需登录，但只有登录用户才计入浏览量）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    return post_to_response(post, db)
+
+
+@router.post("/posts/{post_id}/view")
+async def record_view(
+    post_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    记录帖子浏览（需登录，每用户每帖子只计一次）
+    用于热门排序的48小时滑动窗口算法
+    """
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    is_new = record_post_view(db, post_id, current_user.id)
+
+    return {
+        "success": True,
+        "isNewView": is_new,
+        "message": "浏览已记录" if is_new else "已记录过浏览"
+    }
+
+
+@router.post("/posts", response_model=PostResponse)
+async def create_post(
+    data: PostCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """发布帖子（需登录）"""
+    post = Post(
+        id=str(uuid.uuid4()),
+        userId=current_user.id,
+        title=data.title,
+        content=data.content,
+        images=data.images,
+        nodeId=data.nodeId,
+        topicId=data.topicId,
+        shareCode=data.shareCode,
+        categoryId=data.categoryId,
+        tags=data.tags,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+
+    logger.info(f"用户 {current_user.id} 发布帖子: {post.id}")
+    return post_to_response(post, db)
+
+
+@router.patch("/posts/{post_id}", response_model=PostResponse)
+async def update_post(
+    post_id: str,
+    data: PostUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """编辑帖子（需登录，仅作者）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    if post.userId != current_user.id:
+        raise HTTPException(status_code=403, detail="无权编辑此帖子")
+
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(post, key, value)
+
+    db.commit()
+    db.refresh(post)
+
+    return post_to_response(post, db)
+
+
+@router.delete("/posts/{post_id}")
+async def delete_post(
+    post_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除帖子（需登录，仅作者）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    if post.userId != current_user.id:
+        raise HTTPException(status_code=403, detail="无权删除此帖子")
+
+    # 先删除关联的浏览记录
+    db.query(PostView).filter(PostView.postId == post_id).delete()
+    # 删除关联的评论
+    db.query(Comment).filter(Comment.postId == post_id).delete()
+    # 删除帖子
+    db.delete(post)
+    db.commit()
+
+    logger.info(f"用户 {current_user.id} 删除帖子: {post_id}")
+    return {"message": "删除成功"}
+
+
+# ============ 评论 API ============
+def comment_to_response(comment: Comment, db: Session, include_replies: bool = False) -> CommentResponse:
+    """将 Comment 模型转换为响应"""
+    author = None
+    if comment.user:
+        avatar_url = None
+        if comment.user.profile:
+            avatar_url = comment.user.profile.avatarUrl
+        author = CommentAuthor(
+            id=comment.user.id,
+            username=comment.user.username,
+            nickname=comment.user.nickname,
+            avatarUrl=avatar_url
+        )
+
+    reply_to_user = None
+    if comment.replyToUserId:
+        reply_user = db.query(User).filter(User.id == comment.replyToUserId).first()
+        if reply_user:
+            reply_avatar_url = None
+            if reply_user.profile:
+                reply_avatar_url = reply_user.profile.avatarUrl
+            reply_to_user = CommentAuthor(
+                id=reply_user.id,
+                username=reply_user.username,
+                nickname=reply_user.nickname,
+                avatarUrl=reply_avatar_url
+            )
+
+    replies = None
+    if include_replies:
+        child_comments = db.query(Comment).filter(Comment.parentId == comment.id).order_by(Comment.createdAt).all()
+        replies = [comment_to_response(c, db, False) for c in child_comments]
+
+    return CommentResponse(
+        id=comment.id,
+        postId=comment.postId,
+        userId=comment.userId,
+        content=comment.content,
+        parentId=comment.parentId,
+        replyToUserId=comment.replyToUserId,
+        createdAt=comment.createdAt,
+        author=author,
+        replyToUser=reply_to_user,
+        replies=replies
+    )
+
+
+@router.get("/posts/{post_id}/comments", response_model=list[CommentResponse])
+async def get_comments(
+    post_id: str,
+    db: Session = Depends(get_db),
+):
+    """获取帖子评论列表（无需登录）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    # 获取顶级评论（parentId 为空）
+    top_comments = db.query(Comment).filter(
+        Comment.postId == post_id,
+        Comment.parentId.is_(None)
+    ).order_by(Comment.createdAt).all()
+
+    return [comment_to_response(c, db, include_replies=True) for c in top_comments]
+
+
+@router.post("/posts/{post_id}/comments", response_model=CommentResponse)
+async def create_comment(
+    post_id: str,
+    data: CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """发表评论（需登录）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    # 如果是回复评论，验证父评论存在
+    if data.parentId:
+        parent = db.query(Comment).filter(Comment.id == data.parentId).first()
+        if not parent or parent.postId != post_id:
+            raise HTTPException(status_code=400, detail="回复的评论不存在")
+
+    comment = Comment(
+        id=str(uuid.uuid4()),
+        postId=post_id,
+        userId=current_user.id,
+        content=data.content,
+        parentId=data.parentId,
+        replyToUserId=data.replyToUserId,
+    )
+    db.add(comment)
+
+    # 更新帖子评论数
+    post.commentCount = (post.commentCount or 0) + 1
+
+    db.commit()
+    db.refresh(comment)
+
+    return comment_to_response(comment, db)
+
+
+@router.delete("/comments/{comment_id}")
+async def delete_comment(
+    comment_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除评论（需登录，仅作者）"""
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="评论不存在")
+
+    if comment.userId != current_user.id:
+        raise HTTPException(status_code=403, detail="无权删除此评论")
+
+    post = db.query(Post).filter(Post.id == comment.postId).first()
+
+    # 删除子评论
+    db.query(Comment).filter(Comment.parentId == comment_id).delete()
+    db.delete(comment)
+
+    # 更新帖子评论数
+    if post:
+        post.commentCount = db.query(Comment).filter(Comment.postId == post.id).count()
+
+    db.commit()
+
+    return {"message": "删除成功"}
+
+
+# ============ 分享 API ============
+@router.get("/posts/{post_id}/share", response_model=ShareResponse)
+async def get_share_info(
+    post_id: str,
+    db: Session = Depends(get_db),
+):
+    """获取分享链接/信息（无需登录）"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+
+    # 增加分享计数
+    post.shareCount = (post.shareCount or 0) + 1
+    db.commit()
+
+    # 生成分享文本
+    content_preview = post.content[:100] + "..." if len(post.content) > 100 else post.content
+    share_text = f"【{post.title}】{content_preview} - 来自 Smart Tree 社区"
+
+    return ShareResponse(
+        postId=post.id,
+        title=post.title,
+        url=f"/community/{post.id}",
+        shareText=share_text
+    )

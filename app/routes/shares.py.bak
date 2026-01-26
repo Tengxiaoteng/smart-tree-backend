@@ -1,0 +1,1365 @@
+"""
+知识树分享功能路由
+"""
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional
+import uuid
+import json
+from datetime import datetime, timezone
+
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.models import (
+    User, Topic, KnowledgeNode, Material,
+    TreeShare, TreeSubscription, TreeVersion, TreeUpdateNotification
+)
+from app.schemas.tree_share import (
+    TreeShareCreate, TreeShareUpdate, TreeShareResponse, TreeSharePublicInfo,
+    TreeSubscriptionCreate, TreeSubscriptionResponse,
+    TreeVersionPublish, TreeVersionResponse,
+    TreeUpdateNotificationResponse,
+    TreeDiffResponse, SyncRequest, SyncResponse, NodeDiff, MaterialDiff
+)
+
+router = APIRouter()
+
+
+# ============ 辅助函数 ============
+
+def generate_tree_snapshot(db: Session, topic: Topic) -> dict:
+    """生成知识树的完整快照"""
+    # 获取所有节点
+    nodes = db.query(KnowledgeNode).filter(
+        KnowledgeNode.topicId == topic.id
+    ).all()
+    
+    # 获取所有资料
+    materials = db.query(Material).filter(
+        Material.topicId == topic.id
+    ).all()
+    
+    snapshot = {
+        "topic": {
+            "name": topic.name,
+            "description": topic.description,
+            "scope": topic.scope,
+            "keywords": topic.keywords,
+            "rootNodeId": topic.rootNodeId,
+        },
+        "nodes": {},
+        "materials": {}
+    }
+    
+    # 节点快照（只包含结构性数据，不包含学习进度）
+    for node in nodes:
+        snapshot["nodes"][node.id] = {
+            "name": node.name,
+            "description": node.description,
+            "parentId": node.parentId,
+            "children": node.children or [],
+            "learningObjectives": node.learningObjectives,
+            "keyConcepts": node.keyConcepts,
+            "knowledgeType": node.knowledgeType,
+            "difficulty": node.difficulty,
+            "estimatedMinutes": node.estimatedMinutes,
+            "prerequisites": node.prerequisites,
+            "questionPatterns": node.questionPatterns,
+            "commonMistakes": node.commonMistakes,
+            "materialIds": node.materialIds or [],
+            "aiInferredGoals": node.aiInferredGoals,
+            "source": node.source,
+        }
+    
+    # 资料快照
+    for material in materials:
+        snapshot["materials"][material.id] = {
+            "name": material.name,
+            "type": material.type,
+            "content": material.content,
+            "url": material.url,
+            "fileSize": material.fileSize,
+            "nodeIds": material.nodeIds or [],
+            "tags": material.tags,
+            "organizedContent": material.organizedContent,
+            "aiSummary": material.aiSummary,
+            "extractedConcepts": material.extractedConcepts,
+            "isOrganized": material.isOrganized,
+            "structuredContent": material.structuredContent,
+            "isStructured": material.isStructured,
+        }
+    
+    return snapshot
+
+
+def calculate_diff(old_snapshot: dict, new_snapshot: dict) -> dict:
+    """计算两个快照之间的差异"""
+    diff = {
+        "nodeChanges": [],
+        "materialChanges": [],
+        "summary": {
+            "nodesAdded": 0,
+            "nodesModified": 0,
+            "nodesDeleted": 0,
+            "materialsAdded": 0,
+            "materialsModified": 0,
+            "materialsDeleted": 0,
+        }
+    }
+    
+    old_nodes = old_snapshot.get("nodes", {})
+    new_nodes = new_snapshot.get("nodes", {})
+    old_materials = old_snapshot.get("materials", {})
+    new_materials = new_snapshot.get("materials", {})
+    
+    # 检查节点变化
+    all_node_ids = set(old_nodes.keys()) | set(new_nodes.keys())
+    for node_id in all_node_ids:
+        if node_id not in old_nodes:
+            # 新增节点
+            diff["nodeChanges"].append({
+                "nodeId": node_id,
+                "nodeName": new_nodes[node_id].get("name", ""),
+                "changeType": "added",
+                "changes": new_nodes[node_id]
+            })
+            diff["summary"]["nodesAdded"] += 1
+        elif node_id not in new_nodes:
+            # 删除节点
+            diff["nodeChanges"].append({
+                "nodeId": node_id,
+                "nodeName": old_nodes[node_id].get("name", ""),
+                "changeType": "deleted",
+                "changes": None
+            })
+            diff["summary"]["nodesDeleted"] += 1
+        else:
+            # 检查是否修改
+            old_node = old_nodes[node_id]
+            new_node = new_nodes[node_id]
+            changes = {}
+            for key in new_node:
+                if old_node.get(key) != new_node.get(key):
+                    changes[key] = {"old": old_node.get(key), "new": new_node.get(key)}
+            if changes:
+                diff["nodeChanges"].append({
+                    "nodeId": node_id,
+                    "nodeName": new_node.get("name", ""),
+                    "changeType": "modified",
+                    "changes": changes
+                })
+                diff["summary"]["nodesModified"] += 1
+    
+    # 检查资料变化
+    all_material_ids = set(old_materials.keys()) | set(new_materials.keys())
+    for material_id in all_material_ids:
+        if material_id not in old_materials:
+            diff["materialChanges"].append({
+                "materialId": material_id,
+                "materialName": new_materials[material_id].get("name", ""),
+                "changeType": "added",
+                "changes": new_materials[material_id]
+            })
+            diff["summary"]["materialsAdded"] += 1
+        elif material_id not in new_materials:
+            diff["materialChanges"].append({
+                "materialId": material_id,
+                "materialName": old_materials[material_id].get("name", ""),
+                "changeType": "deleted",
+                "changes": None
+            })
+            diff["summary"]["materialsDeleted"] += 1
+        else:
+            old_mat = old_materials[material_id]
+            new_mat = new_materials[material_id]
+            changes = {}
+            for key in new_mat:
+                if old_mat.get(key) != new_mat.get(key):
+                    changes[key] = {"old": old_mat.get(key), "new": new_mat.get(key)}
+            if changes:
+                diff["materialChanges"].append({
+                    "materialId": material_id,
+                    "materialName": new_mat.get("name", ""),
+                    "changeType": "modified",
+                    "changes": changes
+                })
+                diff["summary"]["materialsModified"] += 1
+
+    return diff
+
+
+# ============ 分享 API ============
+
+@router.post("", response_model=TreeShareResponse)
+async def create_share(
+    data: TreeShareCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """创建知识树分享，如果已分享则返回现有分享信息"""
+    # 检查知识树是否存在且属于当前用户
+    topic = db.query(Topic).filter(
+        Topic.id == data.topicId,
+        Topic.userId == current_user.id
+    ).first()
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="知识树不存在或无权限"
+        )
+
+    # 检查是否已经分享过
+    existing_share = db.query(TreeShare).filter(
+        TreeShare.topicId == data.topicId,
+        TreeShare.ownerId == current_user.id,
+        TreeShare.isActive == True
+    ).first()
+
+    # 如果已经分享过，直接返回现有分享信息
+    if existing_share:
+        return TreeShareResponse(
+            id=existing_share.id,
+            topicId=existing_share.topicId,
+            ownerId=existing_share.ownerId,
+            ownerName=current_user.username or current_user.email,
+            shareCode=existing_share.shareCode,
+            shareType=existing_share.shareType,
+            shareTitle=existing_share.shareTitle,
+            shareDescription=existing_share.shareDescription,
+            currentVersion=existing_share.currentVersion,
+            subscriberCount=existing_share.subscriberCount,
+            isActive=existing_share.isActive,
+            createdAt=existing_share.createdAt,
+            updatedAt=existing_share.updatedAt,
+            copyCount=existing_share.copyCount,
+            viewCount=existing_share.viewCount,
+            allowCopy=getattr(existing_share, "allowCopy", True),
+        )
+
+    # 创建分享记录
+    share = TreeShare(
+        id=str(uuid.uuid4()),
+        topicId=data.topicId,
+        ownerId=current_user.id,
+        shareType=data.shareType,
+        sharePassword=data.sharePassword if data.shareType == "private" else None,
+        shareTitle=data.shareTitle or topic.name,
+        shareDescription=data.shareDescription or topic.description,
+        allowCopy=data.allowCopy if hasattr(data, "allowCopy") else True,
+    )
+    db.add(share)
+    db.flush()
+
+    # 创建初始版本快照
+    snapshot = generate_tree_snapshot(db, topic)
+    version = TreeVersion(
+        id=str(uuid.uuid4()),
+        shareId=share.id,
+        version=1,
+        snapshotData=json.dumps(snapshot, ensure_ascii=False),
+        changeLog="初始版本",
+        changesSummary=json.dumps({
+            "nodesAdded": len(snapshot["nodes"]),
+            "materialsAdded": len(snapshot["materials"]),
+        }, ensure_ascii=False),
+    )
+    db.add(version)
+
+    # 更新 Topic 的 isShared 标记
+    topic.isShared = True
+
+    db.commit()
+    db.refresh(share)
+
+    return TreeShareResponse(
+        **{k: getattr(share, k) for k in TreeShareResponse.model_fields if hasattr(share, k)},
+        topicName=topic.name,
+        ownerName=current_user.nickname or current_user.username
+    )
+
+
+@router.get("/my", response_model=list[TreeShareResponse])
+async def get_my_shares(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取我分享的知识树列表"""
+    shares = db.query(TreeShare).filter(
+        TreeShare.ownerId == current_user.id
+    ).order_by(TreeShare.createdAt.desc()).all()
+
+    result = []
+    for share in shares:
+        topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+        result.append(TreeShareResponse(
+            **{k: getattr(share, k) for k in TreeShareResponse.model_fields
+               if hasattr(share, k) and k not in ['topicName', 'ownerName']},
+            topicName=topic.name if topic else "已删除",
+            ownerName=current_user.nickname or current_user.username
+        ))
+
+    return result
+
+
+@router.get("/code/{share_code}", response_model=TreeSharePublicInfo)
+async def get_share_by_code(
+    share_code: str,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user)
+):
+    """通过分享码获取分享信息（公开接口）"""
+    share = db.query(TreeShare).filter(
+        TreeShare.shareCode == share_code,
+        TreeShare.isActive == True
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在或已失效"
+        )
+
+    # 增加浏览次数
+    share.viewCount += 1
+    db.commit()
+
+    # 获取知识树信息
+    topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="知识树已被删除"
+        )
+
+    # 获取节点和资料数量
+    node_count = db.query(func.count(KnowledgeNode.id)).filter(
+        KnowledgeNode.topicId == topic.id
+    ).scalar() or 0
+
+    material_count = db.query(func.count(Material.id)).filter(
+        Material.topicId == topic.id
+    ).scalar() or 0
+
+    # 获取作者信息
+    owner = db.query(User).filter(User.id == share.ownerId).first()
+
+    return TreeSharePublicInfo(
+        id=share.id,
+        shareCode=share.shareCode,
+        shareType=share.shareType,
+        shareTitle=share.shareTitle,
+        shareDescription=share.shareDescription,
+        currentVersion=share.currentVersion,
+        subscriberCount=share.subscriberCount,
+        copyCount=share.copyCount,
+        createdAt=share.createdAt,
+        topicName=topic.name,
+        topicDescription=topic.description,
+        nodeCount=node_count,
+        materialCount=material_count,
+        ownerName=owner.nickname or owner.username if owner else "未知用户",
+        requiresPassword=share.shareType == "private" and share.sharePassword is not None
+    )
+
+
+@router.put("/{share_id}", response_model=TreeShareResponse)
+async def update_share(
+    share_id: str,
+    data: TreeShareUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """更新分享设置"""
+    share = db.query(TreeShare).filter(
+        TreeShare.id == share_id,
+        TreeShare.ownerId == current_user.id
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在或无权限"
+        )
+
+    # 更新字段
+    if data.shareType is not None:
+        share.shareType = data.shareType
+    if data.sharePassword is not None:
+        share.sharePassword = data.sharePassword if data.sharePassword else None
+    if data.shareTitle is not None:
+        share.shareTitle = data.shareTitle
+    if data.shareDescription is not None:
+        share.shareDescription = data.shareDescription
+    if data.isActive is not None:
+        share.isActive = data.isActive
+
+    db.commit()
+    db.refresh(share)
+
+    topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+
+    return TreeShareResponse(
+        **{k: getattr(share, k) for k in TreeShareResponse.model_fields
+           if hasattr(share, k) and k not in ['topicName', 'ownerName']},
+        topicName=topic.name if topic else "已删除",
+        ownerName=current_user.nickname or current_user.username
+    )
+
+
+@router.delete("/{share_id}")
+async def delete_share(
+    share_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """取消分享"""
+    share = db.query(TreeShare).filter(
+        TreeShare.id == share_id,
+        TreeShare.ownerId == current_user.id
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在或无权限"
+        )
+
+    # 更新 Topic 的 isShared 标记
+    topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+    if topic:
+        topic.isShared = False
+
+    # 删除分享（级联删除订阅、版本、通知）
+    db.delete(share)
+    db.commit()
+
+    return {"success": True, "message": "分享已取消"}
+
+
+@router.post("/code/{share_code}/copy", response_model=TreeSubscriptionResponse)
+async def copy_shared_tree(
+    share_code: str,
+    data: TreeSubscriptionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """复制分享的知识树到自己的账户并创建订阅"""
+    # 查找分享
+    share = db.query(TreeShare).filter(
+        TreeShare.shareCode == share_code,
+        TreeShare.isActive == True
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在或已失效"
+        )
+
+    # 检查密码（如果是私密分享）
+    if share.shareType == "private" and share.sharePassword:
+        if not data.sharePassword or data.sharePassword != share.sharePassword:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="密码错误"
+            )
+
+    # 检查是否已经订阅过
+    existing_sub = db.query(TreeSubscription).filter(
+        TreeSubscription.shareId == share.id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first()
+
+    if existing_sub:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="您已经复制过这个知识树了"
+        )
+
+    # 不能复制自己的知识树
+    if share.ownerId == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不能复制自己分享的知识树"
+        )
+
+    # 获取最新版本快照
+    latest_version = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share.id
+    ).order_by(TreeVersion.version.desc()).first()
+
+    if not latest_version:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="分享数据异常"
+        )
+
+    snapshot = json.loads(latest_version.snapshotData)
+
+    # 创建新的知识树
+    new_topic_name = data.newTopicName or snapshot["topic"]["name"]
+
+    # 检查名称是否重复
+    existing_topic = db.query(Topic).filter(
+        Topic.userId == current_user.id,
+        Topic.name == new_topic_name
+    ).first()
+    if existing_topic:
+        new_topic_name = f"{new_topic_name}（来自分享）"
+
+    new_topic = Topic(
+        id=str(uuid.uuid4()),
+        userId=current_user.id,
+        name=new_topic_name,
+        description=snapshot["topic"].get("description"),
+        scope=snapshot["topic"].get("scope"),
+        keywords=snapshot["topic"].get("keywords"),
+        sourceShareId=share.id,
+    )
+    db.add(new_topic)
+    db.flush()
+
+    # 复制节点（创建ID映射）
+    node_id_map = {}  # 原始ID -> 新ID
+    for old_node_id, node_data in snapshot["nodes"].items():
+        new_node_id = str(uuid.uuid4())
+        node_id_map[old_node_id] = new_node_id
+
+    # 创建节点
+    for old_node_id, node_data in snapshot["nodes"].items():
+        new_node = KnowledgeNode(
+            id=node_id_map[old_node_id],
+            userId=current_user.id,
+            topicId=new_topic.id,
+            name=node_data.get("name", ""),
+            description=node_data.get("description"),
+            parentId=node_id_map.get(node_data.get("parentId")),
+            children=[node_id_map.get(c) for c in (node_data.get("children") or []) if c in node_id_map],
+            learningObjectives=node_data.get("learningObjectives"),
+            keyConcepts=node_data.get("keyConcepts"),
+            knowledgeType=node_data.get("knowledgeType", "concept"),
+            difficulty=node_data.get("difficulty", "beginner"),
+            estimatedMinutes=node_data.get("estimatedMinutes", 15),
+            prerequisites=[node_id_map.get(p) for p in (node_data.get("prerequisites") or []) if p in node_id_map],
+            questionPatterns=node_data.get("questionPatterns"),
+            commonMistakes=node_data.get("commonMistakes"),
+            aiInferredGoals=node_data.get("aiInferredGoals"),
+            source=node_data.get("source", "shared"),
+            materialIds=[],  # 稍后更新
+        )
+        db.add(new_node)
+
+    db.flush()
+
+    # 复制资料（创建ID映射）
+    material_id_map = {}  # 原始ID -> 新ID
+    for old_material_id, material_data in snapshot["materials"].items():
+        new_material_id = str(uuid.uuid4())
+        material_id_map[old_material_id] = new_material_id
+
+        new_material = Material(
+            id=new_material_id,
+            userId=current_user.id,
+            topicId=new_topic.id,
+            name=material_data.get("name", ""),
+            type=material_data.get("type", "text"),
+            content=material_data.get("content"),
+            url=material_data.get("url"),
+            fileSize=material_data.get("fileSize"),
+            nodeIds=[node_id_map.get(n) for n in (material_data.get("nodeIds") or []) if n in node_id_map],
+            tags=material_data.get("tags"),
+            organizedContent=material_data.get("organizedContent"),
+            aiSummary=material_data.get("aiSummary"),
+            extractedConcepts=material_data.get("extractedConcepts"),
+            isOrganized=material_data.get("isOrganized", False),
+            structuredContent=material_data.get("structuredContent"),
+            isStructured=material_data.get("isStructured", False),
+        )
+        db.add(new_material)
+
+    # 更新节点的 materialIds
+    for old_node_id, node_data in snapshot["nodes"].items():
+        new_node_id = node_id_map[old_node_id]
+        old_material_ids = node_data.get("materialIds") or []
+        new_material_ids = [material_id_map.get(m) for m in old_material_ids if m in material_id_map]
+
+        node = db.query(KnowledgeNode).filter(KnowledgeNode.id == new_node_id).first()
+        if node:
+            node.materialIds = new_material_ids
+
+    # 更新 rootNodeId
+    old_root_id = snapshot["topic"].get("rootNodeId")
+    if old_root_id and old_root_id in node_id_map:
+        new_topic.rootNodeId = node_id_map[old_root_id]
+
+    # 保存映射关系
+    new_topic.originalNodeMapping = node_id_map
+    new_topic.originalMaterialMapping = material_id_map
+
+    # 创建订阅记录
+    subscription = TreeSubscription(
+        id=str(uuid.uuid4()),
+        shareId=share.id,
+        subscriberId=current_user.id,
+        localTopicId=new_topic.id,
+        syncedVersion=share.currentVersion,
+        nodeMapping=json.dumps(node_id_map, ensure_ascii=False),
+        materialMapping=json.dumps(material_id_map, ensure_ascii=False),
+    )
+    db.add(subscription)
+
+    # 更新分享统计
+    share.subscriberCount += 1
+    share.copyCount += 1
+
+    db.commit()
+    db.refresh(subscription)
+
+    return TreeSubscriptionResponse(
+        id=subscription.id,
+        shareId=subscription.shareId,
+        subscriberId=subscription.subscriberId,
+        localTopicId=subscription.localTopicId,
+        syncedVersion=subscription.syncedVersion,
+        lastSyncedAt=subscription.lastSyncedAt,
+        autoSync=subscription.autoSync,
+        notifyOnUpdate=subscription.notifyOnUpdate,
+        createdAt=subscription.createdAt,
+        updatedAt=subscription.updatedAt,
+        shareCode=share.shareCode,
+        originalTopicName=snapshot["topic"]["name"],
+        localTopicName=new_topic.name,
+        currentVersion=share.currentVersion,
+        hasPendingUpdates=False
+    )
+
+
+# ============ 订阅管理 API ============
+
+@router.get("/subscriptions/my", response_model=list[TreeSubscriptionResponse])
+async def get_my_subscriptions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取我订阅的知识树列表"""
+    subscriptions = db.query(TreeSubscription).filter(
+        TreeSubscription.subscriberId == current_user.id
+    ).order_by(TreeSubscription.createdAt.desc()).all()
+
+    result = []
+    for sub in subscriptions:
+        share = db.query(TreeShare).filter(TreeShare.id == sub.shareId).first()
+        local_topic = db.query(Topic).filter(Topic.id == sub.localTopicId).first()
+
+        if share:
+            original_topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+            result.append(TreeSubscriptionResponse(
+                id=sub.id,
+                shareId=sub.shareId,
+                subscriberId=sub.subscriberId,
+                localTopicId=sub.localTopicId,
+                syncedVersion=sub.syncedVersion,
+                lastSyncedAt=sub.lastSyncedAt,
+                autoSync=sub.autoSync,
+                notifyOnUpdate=sub.notifyOnUpdate,
+                createdAt=sub.createdAt,
+                updatedAt=sub.updatedAt,
+                shareCode=share.shareCode,
+                originalTopicName=original_topic.name if original_topic else "已删除",
+                localTopicName=local_topic.name if local_topic else "已删除",
+                currentVersion=share.currentVersion,
+                hasPendingUpdates=sub.syncedVersion < share.currentVersion
+            ))
+
+    return result
+
+
+@router.put("/subscriptions/{subscription_id}")
+async def update_subscription(
+    subscription_id: str,
+    data: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """更新订阅设置"""
+    subscription = db.query(TreeSubscription).filter(
+        TreeSubscription.id == subscription_id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first()
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="订阅不存在"
+        )
+
+    # 更新字段
+    if "autoSync" in data:
+        subscription.autoSync = data["autoSync"]
+    if "notifyOnUpdate" in data:
+        subscription.notifyOnUpdate = data["notifyOnUpdate"]
+
+    db.commit()
+    db.refresh(subscription)
+
+    return {"success": True, "message": "订阅设置已更新"}
+
+
+@router.delete("/subscriptions/{subscription_id}")
+async def cancel_subscription(
+    subscription_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """取消订阅（不删除本地知识树）"""
+    subscription = db.query(TreeSubscription).filter(
+        TreeSubscription.id == subscription_id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first()
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="订阅不存在"
+        )
+
+    # 更新分享的订阅者数量
+    share = db.query(TreeShare).filter(TreeShare.id == subscription.shareId).first()
+    if share and share.subscriberCount > 0:
+        share.subscriberCount -= 1
+
+    # 清除本地知识树的来源标记
+    local_topic = db.query(Topic).filter(Topic.id == subscription.localTopicId).first()
+    if local_topic:
+        local_topic.sourceShareId = None
+
+    db.delete(subscription)
+    db.commit()
+
+    return {"success": True, "message": "已取消订阅"}
+
+
+# ============ 版本发布 API ============
+
+@router.post("/{share_id}/publish", response_model=TreeVersionResponse)
+async def publish_update(
+    share_id: str,
+    data: TreeVersionPublish,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """发布知识树更新"""
+    # 检查分享是否存在且属于当前用户
+    share = db.query(TreeShare).filter(
+        TreeShare.id == share_id,
+        TreeShare.ownerId == current_user.id
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在或无权限"
+        )
+
+    # 获取知识树
+    topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="知识树已被删除"
+        )
+
+    # 获取上一个版本的快照
+    prev_version = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share.id
+    ).order_by(TreeVersion.version.desc()).first()
+
+    prev_snapshot = json.loads(prev_version.snapshotData) if prev_version else {"nodes": {}, "materials": {}}
+
+    # 生成新快照
+    new_snapshot = generate_tree_snapshot(db, topic)
+
+    # 计算差异
+    diff = calculate_diff(prev_snapshot, new_snapshot)
+
+    # 检查是否有变化
+    total_changes = sum(diff["summary"].values())
+    if total_changes == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="没有检测到任何变化"
+        )
+
+    # 递增版本号
+    new_version_num = share.currentVersion + 1
+    share.currentVersion = new_version_num
+
+    # 创建新版本
+    new_version = TreeVersion(
+        id=str(uuid.uuid4()),
+        shareId=share.id,
+        version=new_version_num,
+        snapshotData=json.dumps(new_snapshot, ensure_ascii=False),
+        changeLog=data.changeLog or f"版本 {new_version_num} 更新",
+        changesSummary=json.dumps(diff["summary"], ensure_ascii=False),
+    )
+    db.add(new_version)
+    db.flush()
+
+    # 为所有订阅者创建更新通知
+    subscriptions = db.query(TreeSubscription).filter(
+        TreeSubscription.shareId == share.id,
+        TreeSubscription.notifyOnUpdate == True
+    ).all()
+
+    for sub in subscriptions:
+        notification = TreeUpdateNotification(
+            id=str(uuid.uuid4()),
+            subscriptionId=sub.id,
+            versionId=new_version.id,
+            userId=sub.subscriberId,
+        )
+        db.add(notification)
+
+    db.commit()
+    db.refresh(new_version)
+
+    return TreeVersionResponse(
+        id=new_version.id,
+        shareId=new_version.shareId,
+        version=new_version.version,
+        changeLog=new_version.changeLog,
+        changesSummary=diff["summary"],
+        publishedAt=new_version.publishedAt
+    )
+
+
+# ============ 通知 API ============
+
+@router.get("/notifications", response_model=list[TreeUpdateNotificationResponse])
+async def get_update_notifications(
+    unread_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取更新通知列表"""
+    query = db.query(TreeUpdateNotification).filter(
+        TreeUpdateNotification.userId == current_user.id
+    )
+
+    if unread_only:
+        query = query.filter(TreeUpdateNotification.isRead == False)
+
+    notifications = query.order_by(TreeUpdateNotification.createdAt.desc()).all()
+
+    result = []
+    for notif in notifications:
+        version = db.query(TreeVersion).filter(TreeVersion.id == notif.versionId).first()
+        subscription = db.query(TreeSubscription).filter(TreeSubscription.id == notif.subscriptionId).first()
+        share = db.query(TreeShare).filter(TreeShare.id == subscription.shareId).first() if subscription else None
+        topic = db.query(Topic).filter(Topic.id == share.topicId).first() if share else None
+
+        result.append(TreeUpdateNotificationResponse(
+            id=notif.id,
+            subscriptionId=notif.subscriptionId,
+            versionId=notif.versionId,
+            userId=notif.userId,
+            isRead=notif.isRead,
+            isApplied=notif.isApplied,
+            createdAt=notif.createdAt,
+            readAt=notif.readAt,
+            appliedAt=notif.appliedAt,
+            version=version.version if version else None,
+            changeLog=version.changeLog if version else None,
+            topicName=topic.name if topic else "已删除",
+            shareCode=share.shareCode if share else None,
+            changesSummary=json.loads(version.changesSummary) if version and version.changesSummary else None
+        ))
+
+    return result
+
+
+@router.put("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """标记通知为已读"""
+    notification = db.query(TreeUpdateNotification).filter(
+        TreeUpdateNotification.id == notification_id,
+        TreeUpdateNotification.userId == current_user.id
+    ).first()
+
+    if not notification:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="通知不存在"
+        )
+
+    notification.mark_as_read()
+    db.commit()
+
+    return {"success": True}
+
+
+@router.put("/notifications/read-all")
+async def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """标记所有通知为已读"""
+    db.query(TreeUpdateNotification).filter(
+        TreeUpdateNotification.userId == current_user.id,
+        TreeUpdateNotification.isRead == False
+    ).update({
+        TreeUpdateNotification.isRead: True,
+        TreeUpdateNotification.readAt: datetime.now(timezone.utc)
+    })
+    db.commit()
+
+    return {"success": True}
+
+
+# ============ 差异与同步 API ============
+
+@router.get("/subscriptions/{subscription_id}/diff", response_model=TreeDiffResponse)
+async def get_subscription_diff(
+    subscription_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取订阅的差异报告 - 基于本地实际状态与最新版本的差异"""
+    subscription = db.query(TreeSubscription).filter(
+        TreeSubscription.id == subscription_id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first()
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="订阅不存在"
+        )
+
+    share = db.query(TreeShare).filter(TreeShare.id == subscription.shareId).first()
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享已被删除"
+        )
+
+    # 获取最新版本的快照
+    latest_version = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share.id,
+        TreeVersion.version == share.currentVersion
+    ).first()
+
+    if not latest_version:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="版本数据异常"
+        )
+
+    new_snapshot = json.loads(latest_version.snapshotData)
+
+    # 构建本地实际状态的快照（基于映射关系）
+    node_mapping = json.loads(subscription.nodeMapping or "{}")
+    material_mapping = json.loads(subscription.materialMapping or "{}")
+
+    # 反转映射：本地ID -> 原始ID
+    reverse_node_mapping = {v: k for k, v in node_mapping.items()}
+    reverse_material_mapping = {v: k for k, v in material_mapping.items()}
+
+    # 获取本地知识树的实际节点
+    local_topic = db.query(Topic).filter(Topic.id == subscription.localTopicId).first()
+    if not local_topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="本地知识树不存在"
+        )
+
+    local_nodes = db.query(KnowledgeNode).filter(
+        KnowledgeNode.topicId == local_topic.id
+    ).all()
+
+    local_materials = db.query(Material).filter(
+        Material.topicId == local_topic.id
+    ).all()
+
+    # 构建本地状态快照（使用原始ID作为key）
+    local_snapshot = {"nodes": {}, "materials": {}}
+
+    for node in local_nodes:
+        orig_id = reverse_node_mapping.get(node.id)
+        if orig_id:
+            local_snapshot["nodes"][orig_id] = {
+                "name": node.name,
+                "description": node.description,
+                "learningObjectives": node.learningObjectives,
+                "keyConcepts": node.keyConcepts,
+                "knowledgeType": node.knowledgeType,
+                "difficulty": node.difficulty,
+                "estimatedMinutes": node.estimatedMinutes,
+            }
+
+    for material in local_materials:
+        orig_id = reverse_material_mapping.get(material.id)
+        if orig_id:
+            local_snapshot["materials"][orig_id] = {
+                "name": material.name,
+                "content": material.content,
+                "type": material.type,
+            }
+
+    # 计算本地实际状态与最新版本的差异
+    diff = calculate_diff(local_snapshot, new_snapshot)
+
+    return TreeDiffResponse(
+        fromVersion=subscription.syncedVersion,
+        toVersion=share.currentVersion,
+        nodeChanges=[NodeDiff(**nc) for nc in diff["nodeChanges"]],
+        materialChanges=[MaterialDiff(**mc) for mc in diff["materialChanges"]],
+        summary=diff["summary"]
+    )
+
+
+@router.post("/subscriptions/{subscription_id}/sync", response_model=SyncResponse)
+async def sync_subscription(
+    subscription_id: str,
+    data: SyncRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """应用更新到本地知识树"""
+    subscription = db.query(TreeSubscription).filter(
+        TreeSubscription.id == subscription_id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first()
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="订阅不存在"
+        )
+
+    share = db.query(TreeShare).filter(TreeShare.id == subscription.shareId).first()
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享已被删除"
+        )
+
+    # 获取最新版本快照
+    latest_version = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share.id,
+        TreeVersion.version == share.currentVersion
+    ).first()
+
+    if not latest_version:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="版本数据异常"
+        )
+
+    new_snapshot = json.loads(latest_version.snapshotData)
+
+    # 获取本地知识树
+    local_topic = db.query(Topic).filter(Topic.id == subscription.localTopicId).first()
+    if not local_topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="本地知识树已被删除"
+        )
+
+    # 加载现有映射
+    node_mapping = json.loads(subscription.nodeMapping) if subscription.nodeMapping else {}
+    material_mapping = json.loads(subscription.materialMapping) if subscription.materialMapping else {}
+
+    # 获取已同步版本的快照（用于计算差异）
+    synced_version = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share.id,
+        TreeVersion.version == subscription.syncedVersion
+    ).first()
+    old_snapshot = json.loads(synced_version.snapshotData) if synced_version else {"nodes": {}, "materials": {}}
+
+    nodes_updated = 0
+    nodes_deleted = 0
+    materials_updated = 0
+    materials_deleted = 0
+
+    # 计算所有删除的节点和资料（在旧快照中存在但在新快照中不存在）
+    all_deleted_node_ids = set(old_snapshot["nodes"].keys()) - set(new_snapshot["nodes"].keys())
+    all_deleted_material_ids = set(old_snapshot["materials"].keys()) - set(new_snapshot["materials"].keys())
+
+    # 确定要处理的节点和资料
+    if data.acceptAll:
+        accepted_node_ids = set(new_snapshot["nodes"].keys())
+        accepted_material_ids = set(new_snapshot["materials"].keys())
+        # 也包括删除的节点和资料
+        deleted_node_ids = all_deleted_node_ids
+        deleted_material_ids = all_deleted_material_ids
+    else:
+        user_accepted_ids = set(data.acceptedNodeIds or [])
+        user_accepted_material_ids = set(data.acceptedMaterialIds or [])
+
+        # 分离出用户选择的：新增/修改的节点 vs 删除的节点
+        accepted_node_ids = user_accepted_ids - all_deleted_node_ids
+        deleted_node_ids = user_accepted_ids & all_deleted_node_ids
+
+        accepted_material_ids = user_accepted_material_ids - all_deleted_material_ids
+        deleted_material_ids = user_accepted_material_ids & all_deleted_material_ids
+
+    # 处理删除的节点
+    for orig_node_id in deleted_node_ids:
+        local_node_id = node_mapping.get(orig_node_id)
+        if local_node_id:
+            node = db.query(KnowledgeNode).filter(KnowledgeNode.id == local_node_id).first()
+            if node:
+                db.delete(node)
+                nodes_deleted += 1
+            # 从映射中移除
+            del node_mapping[orig_node_id]
+
+    # 处理删除的资料
+    for orig_mat_id in deleted_material_ids:
+        local_mat_id = material_mapping.get(orig_mat_id)
+        if local_mat_id:
+            material = db.query(Material).filter(Material.id == local_mat_id).first()
+            if material:
+                db.delete(material)
+                materials_deleted += 1
+            del material_mapping[orig_mat_id]
+
+    db.flush()
+
+    # 更新/添加节点
+    for orig_node_id in accepted_node_ids:
+        if orig_node_id not in new_snapshot["nodes"]:
+            continue
+        node_data = new_snapshot["nodes"][orig_node_id]
+        local_node_id = node_mapping.get(orig_node_id)
+
+        if local_node_id:
+            # 更新现有节点
+            node = db.query(KnowledgeNode).filter(KnowledgeNode.id == local_node_id).first()
+            if node:
+                node.name = node_data.get("name", node.name)
+                node.description = node_data.get("description")
+                node.learningObjectives = node_data.get("learningObjectives")
+                node.keyConcepts = node_data.get("keyConcepts")
+                node.knowledgeType = node_data.get("knowledgeType", "concept")
+                node.difficulty = node_data.get("difficulty", "beginner")
+                node.estimatedMinutes = node_data.get("estimatedMinutes", 15)
+                node.questionPatterns = node_data.get("questionPatterns")
+                node.commonMistakes = node_data.get("commonMistakes")
+                node.aiInferredGoals = node_data.get("aiInferredGoals")
+                nodes_updated += 1
+        else:
+            # 添加新节点
+            new_node_id = str(uuid.uuid4())
+            node_mapping[orig_node_id] = new_node_id
+
+            new_node = KnowledgeNode(
+                id=new_node_id,
+                userId=current_user.id,
+                topicId=local_topic.id,
+                name=node_data.get("name", ""),
+                description=node_data.get("description"),
+                learningObjectives=node_data.get("learningObjectives"),
+                keyConcepts=node_data.get("keyConcepts"),
+                knowledgeType=node_data.get("knowledgeType", "concept"),
+                difficulty=node_data.get("difficulty", "beginner"),
+                estimatedMinutes=node_data.get("estimatedMinutes", 15),
+                questionPatterns=node_data.get("questionPatterns"),
+                commonMistakes=node_data.get("commonMistakes"),
+                aiInferredGoals=node_data.get("aiInferredGoals"),
+                source="synced",
+            )
+            db.add(new_node)
+            nodes_updated += 1
+
+    db.flush()
+
+    # 更新节点的父子关系
+    for orig_node_id in accepted_node_ids:
+        if orig_node_id not in new_snapshot["nodes"]:
+            continue
+        node_data = new_snapshot["nodes"][orig_node_id]
+        local_node_id = node_mapping.get(orig_node_id)
+        if local_node_id:
+            node = db.query(KnowledgeNode).filter(KnowledgeNode.id == local_node_id).first()
+            if node:
+                orig_parent_id = node_data.get("parentId")
+                node.parentId = node_mapping.get(orig_parent_id) if orig_parent_id else None
+
+                orig_children = node_data.get("children") or []
+                node.children = [node_mapping.get(c) for c in orig_children if c in node_mapping]
+
+    # 更新/添加资料
+    for orig_mat_id in accepted_material_ids:
+        if orig_mat_id not in new_snapshot["materials"]:
+            continue
+        mat_data = new_snapshot["materials"][orig_mat_id]
+        local_mat_id = material_mapping.get(orig_mat_id)
+
+        if local_mat_id:
+            material = db.query(Material).filter(Material.id == local_mat_id).first()
+            if material:
+                material.name = mat_data.get("name", material.name)
+                material.content = mat_data.get("content")
+                material.organizedContent = mat_data.get("organizedContent")
+                material.aiSummary = mat_data.get("aiSummary")
+                # 更新 nodeIds 映射
+                orig_node_ids = mat_data.get("nodeIds") or []
+                material.nodeIds = [node_mapping.get(n) for n in orig_node_ids if n in node_mapping]
+                materials_updated += 1
+        else:
+            new_mat_id = str(uuid.uuid4())
+            material_mapping[orig_mat_id] = new_mat_id
+
+            new_material = Material(
+                id=new_mat_id,
+                userId=current_user.id,
+                topicId=local_topic.id,
+                name=mat_data.get("name", ""),
+                type=mat_data.get("type", "text"),
+                content=mat_data.get("content"),
+                url=mat_data.get("url"),
+                nodeIds=[node_mapping.get(n) for n in (mat_data.get("nodeIds") or []) if n in node_mapping],
+            )
+            db.add(new_material)
+            materials_updated += 1
+
+    # 更新订阅状态
+    subscription.syncedVersion = share.currentVersion
+    subscription.lastSyncedAt = datetime.now(timezone.utc)
+    subscription.nodeMapping = json.dumps(node_mapping, ensure_ascii=False)
+    subscription.materialMapping = json.dumps(material_mapping, ensure_ascii=False)
+
+    # 标记相关通知为已应用
+    db.query(TreeUpdateNotification).filter(
+        TreeUpdateNotification.subscriptionId == subscription.id,
+        TreeUpdateNotification.isApplied == False
+    ).update({
+        TreeUpdateNotification.isApplied: True,
+        TreeUpdateNotification.appliedAt: datetime.now(timezone.utc)
+    })
+
+    db.commit()
+
+    return SyncResponse(
+        success=True,
+        syncedVersion=share.currentVersion,
+        nodesUpdated=nodes_updated,
+        materialsUpdated=materials_updated,
+        conflicts=None
+    )
+
+
+# ============ 版本历史 API ============
+
+@router.get("/{share_id}/versions", response_model=list[TreeVersionResponse])
+async def get_share_versions(
+    share_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """获取分享的版本历史"""
+    share = db.query(TreeShare).filter(TreeShare.id == share_id).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="分享不存在"
+        )
+
+    # 检查权限（分享者或订阅者可以查看）
+    is_owner = share.ownerId == current_user.id
+    is_subscriber = db.query(TreeSubscription).filter(
+        TreeSubscription.shareId == share_id,
+        TreeSubscription.subscriberId == current_user.id
+    ).first() is not None
+
+    if not is_owner and not is_subscriber:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权查看版本历史"
+        )
+
+    versions = db.query(TreeVersion).filter(
+        TreeVersion.shareId == share_id
+    ).order_by(TreeVersion.version.desc()).all()
+
+    return [
+        TreeVersionResponse(
+            id=v.id,
+            shareId=v.shareId,
+            version=v.version,
+            changeLog=v.changeLog,
+            changesSummary=json.loads(v.changesSummary) if v.changesSummary else {},
+            publishedAt=v.publishedAt
+        )
+        for v in versions
+    ]
+
+
+@router.get("/explore", response_model=list[TreeSharePublicInfo])
+async def explore_public_shares(
+    skip: int = 0,
+    limit: int = 20,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """浏览公开分享的知识树"""
+    query = db.query(TreeShare).filter(
+        TreeShare.shareType == "public",
+        TreeShare.isActive == True
+    )
+
+    if search:
+        query = query.join(Topic, TreeShare.topicId == Topic.id).filter(
+            (TreeShare.shareTitle.contains(search)) |
+            (Topic.name.contains(search)) |
+            (TreeShare.shareDescription.contains(search))
+        )
+
+    shares = query.order_by(
+        TreeShare.subscriberCount.desc(),
+        TreeShare.createdAt.desc()
+    ).offset(skip).limit(limit).all()
+
+    result = []
+    for share in shares:
+        topic = db.query(Topic).filter(Topic.id == share.topicId).first()
+        owner = db.query(User).filter(User.id == share.ownerId).first()
+
+        node_count = db.query(func.count(KnowledgeNode.id)).filter(
+            KnowledgeNode.topicId == share.topicId
+        ).scalar() or 0
+
+        material_count = db.query(func.count(Material.id)).filter(
+            Material.topicId == share.topicId
+        ).scalar() or 0
+
+        result.append(TreeSharePublicInfo(
+            id=share.id,
+            shareCode=share.shareCode,
+            shareType=share.shareType,
+            shareTitle=share.shareTitle,
+            shareDescription=share.shareDescription,
+            currentVersion=share.currentVersion,
+            subscriberCount=share.subscriberCount,
+            copyCount=share.copyCount,
+            createdAt=share.createdAt,
+            topicName=topic.name if topic else "已删除",
+            topicDescription=topic.description if topic else None,
+            nodeCount=node_count,
+            materialCount=material_count,
+            ownerName=owner.nickname or owner.username if owner else "未知用户",
+            requiresPassword=False
+        ))
+
+    return result
+

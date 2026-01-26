@@ -1,0 +1,14 @@
+.env
+.env.sqlite
+__pycache__/
+*.pyc
+*.db
+*.log
+stability_report*.json
+.DS_Store
+venv/
+.venv/
+uploads/
+
+# Backup files
+*.backup
